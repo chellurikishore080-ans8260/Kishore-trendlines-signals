@@ -2,9 +2,12 @@
 Trendline Zone Scanner - Binance Spot (all USDT pairs)
 Author: Kishore
 
-Scans every Binance Spot USDT pair on 5m / 15m / 30m / 1h / 4h, builds the
-nearest support / resistance trendline zone for each coin and alerts the moment
-a candle wick touches that zone. The screen refreshes itself - no manual scan.
+Scans every Binance Spot USDT pair on 5m / 15m / 30m / 1h / 4h and builds the
+nearest support / resistance trendline zone for each coin. Two separate signals:
+  1. Touch  - a candle wick touches the zone on its own timeframe.
+  2. Sweep  - a 1-minute candle sweeps (wick beyond the zone edge, closes back)
+              near that same-timeframe zone.
+The screen refreshes itself - no manual scan, no sidebar.
 
 Zone logic follows the open-source "Trendlines" Pine indicator (MPL-2.0),
 re-implemented here in Python.
@@ -50,6 +53,7 @@ ATR_LEN = 14
 ATR_MULT = 0.5      # fixed zone width (same as the Pine script)
 STABILITY = 5       # stability buffer in bars (same as the Pine script)
 KLINES = 400        # candles fetched per coin / timeframe
+CAND_PCT = 3.0      # 1m candles are fetched only for coins within this % of a zone
 
 _session = requests.Session()
 _session.headers.update({"User-Agent": "Mozilla/5.0"})
@@ -276,16 +280,17 @@ def touch_series(z, h, l, idxs, pierce):
 
 
 def analyze(sym, tf, d, cfg):
+    """Returns (touch/breakout rows, zone infos used later for the 1m sweep check)."""
     zones = compute_zones(d, cfg)
     if not zones:
-        return []
+        return [], []
     h, l, c, t = d["h"], d["l"], d["c"], d["t"]
     last = len(c) - 1
     W = cfg["window"]
     cd = cfg["cooldown"].get(tf, 5)
     price = float(c[-1])
     coin = sym[:-4]
-    rows = []
+    rows, zinfos = [], []
     for key, z in zones.items():
         if not z:
             continue
@@ -297,6 +302,11 @@ def analyze(sym, tf, d, cfg):
             dist = (bot - price) / price * 100
         else:
             dist = 0.0
+        zinfos.append(dict(
+            symbol=sym, coin=coin, tf=tf, kind=key, z=z, last=last,
+            t_last=int(t[last]), step=TF_SECONDS[tf] * 1000,
+            dist=float(dist), pivots=z["touches"],
+        ))
 
         def row(status, signal, age, bar_idx):
             return dict(
@@ -326,11 +336,11 @@ def analyze(sym, tf, d, cfg):
                 rows.append(row("BREAKOUT", "Resistance breakout ↑", 0, last))
             if (not res) and c[-1] < bot and c[-2] >= bot_p:
                 rows.append(row("BREAKOUT", "Support breakdown ↓", 0, last))
-    return rows
+    return rows, zinfos
 
 
 def scan_all(base, store, symbols, tfs, cfg, workers=16):
-    sigs, ok, fail = [], 0, 0
+    sigs, zinfos, ok, fail = [], [], 0, 0
 
     def job(sym, tf):
         d = get_klines(base, store, sym, tf)
@@ -349,15 +359,99 @@ def scan_all(base, store, symbols, tfs, cfg, workers=16):
                 fail += 1
             else:
                 ok += 1
-                sigs.extend(r)
+                sigs.extend(r[0])
+                zinfos.extend(r[1])
     order = {"FRESH": 0, "BREAKOUT": 1, "REPEAT": 2}
     sigs.sort(key=lambda x: (order[x["status"]], x["age"], x["dist"]))
-    return sigs, ok, fail
+    return sigs, zinfos, ok, fail
+
+
+# ───────────────────── Signal 2: 1-minute sweep at the zone ─────────────────────
+def find_sweeps(m, zinfos, cfg):
+    """1m sweep candles against the HTF zones of one coin.
+
+    Resistance sweep: the 1m wick pokes above the zone's top edge, the candle
+    opens at/below that edge and closes back at/below it.
+    Support sweep: mirror image below the zone's bottom edge.
+    The wick may overshoot the edge by at most `sweep_cap` % (more than that is a
+    real breakout, not a sweep) and must be at least `sweep_wick` % of the candle.
+    The zone is projected to each 1m candle's own time along its slope.
+    """
+    n = len(m["t"])
+    if n < 2:
+        return []
+    idxs = list(range(max(0, n - 1 - cfg["sweep_win"]), n - 1))  # closed candles
+    if cfg["sweep_forming"]:
+        idxs.append(n - 1)  # the last candle is still forming
+    price = float(m["c"][-1])
+    rows = []
+    for zi in zinfos:
+        res = zi["kind"] == "res"
+        for i in idxs:
+            o, h, l, c = (float(m[k][i]) for k in ("o", "h", "l", "c"))
+            rng = h - l
+            if rng <= 0:
+                continue
+            fidx = zi["last"] + (int(m["t"][i]) - zi["t_last"]) / zi["step"]
+            top, bot = zone_at(zi["z"], fidx)
+            if res:
+                if not (o <= top and h > top and c <= top):
+                    continue
+                over = (h - top) / top * 100
+                wick = (h - max(o, c)) / rng * 100
+            else:
+                if not (o >= bot and l < bot and c >= bot):
+                    continue
+                over = (bot - l) / bot * 100
+                wick = (min(o, c) - l) / rng * 100
+            if over > cfg["sweep_cap"] or wick < cfg["sweep_wick"]:
+                continue
+            rows.append(dict(
+                status="SWEEP", coin=zi["coin"], symbol=zi["symbol"], tf=zi["tf"],
+                kind=zi["kind"],
+                signal="Resistance sweep ↓" if res else "Support sweep ↑",
+                price=price, bot=float(bot), top=float(top), dist=zi["dist"],
+                over=float(over), wick=float(wick), age=int(n - 1 - i),
+                pivots=zi["pivots"], bar=int(m["t"][i]),
+            ))
+    return rows
+
+
+def scan_sweeps(base, zinfos, cfg, workers=16):
+    """Fetch 1m candles only for coins whose price is near a zone, then look for sweeps."""
+    by_sym = {}
+    for zi in zinfos:
+        if zi["dist"] <= CAND_PCT:
+            by_sym.setdefault(zi["symbol"], []).append(zi)
+    n = cfg["sweep_win"] + 3
+
+    def job(sym, zl):
+        m = fetch_klines(base, sym, "1m", limit=n, min_len=2)
+        return None if m is None else find_sweeps(m, zl, cfg)
+
+    rows, fail = [], 0
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = [ex.submit(job, s, zl) for s, zl in by_sym.items()]
+        for f in as_completed(futs):
+            try:
+                r = f.result()
+            except Exception:
+                r = None
+            if r is None:
+                fail += 1
+            else:
+                rows.extend(r)
+    rows.sort(key=lambda x: (x["age"], x["over"]))
+    return rows, len(by_sym), fail
 
 
 # ───────────────────────────── Alerts ─────────────────────────────
-@lru_cache(maxsize=1)
-def beep_wav():
+@lru_cache(maxsize=2)
+def beep_wav(kind="touch"):
+    """Two different tones so you can tell the signals apart without looking."""
+    notes = ((880, 0.18), (1175, 0.18), (880, 0.18))          # touch
+    if kind == "sweep":
+        notes = ((1320, 0.12), (1760, 0.12), (1320, 0.12), (1760, 0.12))
     sr = 22050
     buf = io.BytesIO()
     with wave.open(buf, "wb") as w:
@@ -365,7 +459,7 @@ def beep_wav():
         w.setsampwidth(2)
         w.setframerate(sr)
         frames = bytearray()
-        for f, dur in ((880, 0.18), (1175, 0.18), (880, 0.18)):
+        for f, dur in notes:
             n = int(sr * dur)
             for i in range(n):
                 env = min(1.0, i / 200, (n - i) / 200)
@@ -403,6 +497,12 @@ def fp(x):
 
 
 def alert_text(s):
+    if s["status"] == "SWEEP":
+        return (
+            f"⚡ {s['signal']} (1m sweep)\n{s['symbol']} · {s['tf']} trendline\n"
+            f"Price {fp(s['price'])} | Zone {fp(s['bot'])} - {fp(s['top'])} | "
+            f"overshoot {s['over']:.2f}%"
+        )
     icon = "\U0001F525" if s["status"] == "FRESH" else "\U0001F680"
     return (
         f"{icon} {s['signal']}\n{s['symbol']} · {s['tf']}\n"
@@ -454,34 +554,48 @@ def make_chart(d, tf, cfg, show=150):
 
 # ───────────────────────────── App ─────────────────────────────
 def main():
-    st.set_page_config(page_title="Trendline Zone Scanner", page_icon="\U0001F4C8", layout="wide")
+    st.set_page_config(
+        page_title="Trendline Zone Scanner", page_icon="\U0001F4C8", layout="wide",
+        initial_sidebar_state="collapsed",
+    )
     st.title("\U0001F4C8 Trendline Zone Scanner")
-    st.caption("Binance Spot · all USDT pairs · wick touch alerts · by Kishore")
+    st.caption("Binance Spot · all USDT pairs · auto scan · by Kishore")
 
-    with st.sidebar:
-        st.header("Scan")
+    # No sidebar and no scan button: scanning starts by itself with these defaults.
+    with st.expander("⚙️ Settings (optional - scan automatic ga run avtundi)", expanded=False):
         tfs = st.multiselect("Timeframes", TF_OPTIONS, default=TF_OPTIONS)
         refresh = st.select_slider("Auto refresh (seconds)", [30, 60, 90, 120, 180, 300], value=60)
         min_vol = st.number_input("Min 24h volume (million USDT, 0 = all coins)", 0.0, 1000.0, 0.0, 1.0)
+
+        st.markdown("**Signal 1 · Trendline touch**")
         window = st.slider("Check last N candles for a touch", 1, 5, 1)
         pierce = st.checkbox(
             "Also count a wick that spikes through the whole zone "
             "(TradingView alert does not count this)", False)
         breakouts = st.checkbox("Also show zone breakouts (close beyond zone)", True)
         show_repeat = st.checkbox("Show REPEAT touches", True)
+        st.caption("Fresh-touch cooldown (candles): a coin that touched before counts "
+                   "as FRESH again after this many candles.")
+        cooldown = {}
+        for col, tf in zip(st.columns(max(len(tfs), 1)), tfs):
+            cooldown[tf] = col.number_input(tf, 1, 50, 5, key=f"cd_{tf}")
 
-        st.header("Trendline logic")
+        st.markdown("**Signal 2 · 1-minute sweep at the trendline**")
+        sweep_on = st.checkbox("Enable 1m sweep signal", True)
+        sweep_cap = st.slider("Max wick overshoot beyond the zone (%)", 0.05, 2.0, 0.5, 0.05)
+        sweep_wick = st.slider("Min sweep wick (% of the 1m candle)", 0, 80, 20, 5)
+        sweep_win = st.slider("Check last N closed 1m candles", 1, 10, 3)
+        sweep_forming = st.checkbox(
+            "Also use the still-forming 1m candle (faster, but can flip before it closes)", False)
+
+        st.markdown("**Trendline logic**")
         back = st.slider("Bars to apply", 50, 350, 300)
         src = st.selectbox("Pivot source", ["High/Low", "Close"])
         strength = st.slider("Pivot strength", 5, 15, 10)
         min_touches = st.slider("Min pivot confirmation", 2, 8, 3)
 
-        with st.expander("Fresh-touch cooldown (candles)"):
-            st.caption("A coin that touched before counts as FRESH again after this many candles.")
-            cooldown = {tf: st.number_input(tf, 1, 50, 5, key=f"cd_{tf}") for tf in tfs}
-
-        st.header("Alerts")
-        sound = st.checkbox("Sound + popup on new FRESH touch", True)
+        st.markdown("**Alerts**")
+        sound = st.checkbox("Sound + popup on new signals", True)
         tg_token = st.text_input("Telegram bot token (optional)", secret("TELEGRAM_TOKEN"), type="password")
         tg_chat = st.text_input("Telegram chat id (optional)", secret("TELEGRAM_CHAT_ID"))
 
@@ -492,6 +606,8 @@ def main():
     cfg = dict(
         src=src, strength=strength, min_touches=min_touches, back=back,
         window=window, cooldown=cooldown, pierce=pierce, breakouts=breakouts,
+        sweep=sweep_on, sweep_cap=sweep_cap, sweep_wick=sweep_wick,
+        sweep_win=sweep_win, sweep_forming=sweep_forming,
     )
 
     store = kline_store()
@@ -523,80 +639,113 @@ def main():
         if cache and cache["sig"] == sig and time.time() - cache["ts"] < refresh * 0.9:
             # the chart picker (a widget inside this fragment) reran it: reuse the
             # last scan instead of hitting Binance again
-            sigs, fail, took, scanned_at = (
-                cache["sigs"], cache["fail"], cache["took"], cache["at"])
+            sigs, sweeps, n_cand, fail, took, scanned_at = (
+                cache["sigs"], cache["sweeps"], cache["n_cand"], cache["fail"],
+                cache["took"], cache["at"])
         else:
             t0 = time.time()
-            sigs, ok, fail = scan_all(base, store, symbols, tfs, cfg)
-            took = time.time() - t0
+            sigs, zinfos, ok, fail = scan_all(base, store, symbols, tfs, cfg)
             if ok == 0:
                 st.error("Ekkada nundi kuda candles raaledu (Binance block / rate limit).")
                 return
+            sweeps, n_cand = [], 0
+            if cfg["sweep"]:
+                sweeps, n_cand, f2 = scan_sweeps(base, zinfos, cfg)
+                fail += f2
+            took = time.time() - t0
             scanned_at = datetime.now(IST).strftime("%H:%M:%S")
             st.session_state["scan_cache"] = dict(
-                sig=sig, ts=t0, sigs=sigs, fail=fail, took=took, at=scanned_at)
+                sig=sig, ts=t0, sigs=sigs, sweeps=sweeps, n_cand=n_cand,
+                fail=fail, took=took, at=scanned_at)
 
-            # alerts for new FRESH touches and breakouts
+            # alerts: new touches / breakouts (signal 1) and new 1m sweeps (signal 2)
             seen = st.session_state.setdefault("seen", set())
             first_run = "seen_init" not in st.session_state
             st.session_state["seen_init"] = True
-            new = []
+            new_t, new_s = [], []
             for s in sigs:
                 key = f"{s['symbol']}|{s['tf']}|{s['signal']}|{s['bar']}"
                 if key not in seen:
                     seen.add(key)
                     if s["status"] in ("FRESH", "BREAKOUT"):
-                        new.append(s)
+                        new_t.append(s)
+            for s in sweeps:
+                key = f"S|{s['symbol']}|{s['tf']}|{s['kind']}|{s['bar']}"
+                if key not in seen:
+                    seen.add(key)
+                    new_s.append(s)
             if len(seen) > 5000:
                 seen.clear()
+            new = new_s + new_t
             if new and not first_run:
+                kinds = {"SWEEP": "⚡ Sweep 1m", "FRESH": "\U0001F525 Touch",
+                         "BREAKOUT": "\U0001F680 Breakout"}
                 log = st.session_state.setdefault("log", [])
                 for s in reversed(new):
                     log.insert(0, {
-                        "Time": scanned_at, "Coin": s["coin"], "TF": s["tf"],
-                        "Signal": s["signal"], "Price": fp(s["price"]),
+                        "Time": scanned_at, "Type": kinds[s["status"]], "Coin": s["coin"],
+                        "Zone TF": s["tf"], "Signal": s["signal"], "Price": fp(s["price"]),
                     })
                 del log[100:]
                 if sound:
-                    for s in new[:5]:
-                        st.toast(f"{s['signal']}  {s['symbol']} {s['tf']}", icon="\U0001F525")
-                    st.audio(beep_wav(), format="audio/wav", autoplay=True)
+                    for s in new[:6]:
+                        icon = "⚡" if s["status"] == "SWEEP" else "\U0001F525"
+                        st.toast(f"{s['signal']}  {s['symbol']} {s['tf']}", icon=icon)
+                    st.audio(beep_wav("sweep" if new_s else "touch"),
+                             format="audio/wav", autoplay=True)
                 send_telegram(tg_token, tg_chat, "\n\n".join(alert_text(s) for s in new[:15]))
 
-        n_fresh = sum(1 for s in sigs if s["status"] == "FRESH")
         st.caption(
             f"{len(symbols)} coins × {len(tfs)} TF scanned in {took:.0f}s "
             f"(failed requests: {fail}) · last scan {scanned_at} IST · "
-            f"\U0001F525 {n_fresh} fresh"
+            f"auto refresh every {refresh}s"
         )
+
+        # ── Signal 1: trendline touch ──
+        shown = [s for s in sigs if show_repeat or s["status"] != "REPEAT"]
+        n_fresh = sum(1 for s in sigs if s["status"] == "FRESH")
+        st.subheader(f"\U0001F525 Signal 1 · Trendline touch ({n_fresh} fresh)")
+        if shown:
+            label = {"FRESH": "\U0001F525 FRESH", "BREAKOUT": "\U0001F680 BREAKOUT", "REPEAT": "REPEAT"}
+            st.dataframe(pd.DataFrame([{
+                "Status": label[s["status"]], "Coin": s["coin"], "TF": s["tf"],
+                "Signal": s["signal"], "Price": fp(s["price"]),
+                "Zone low": fp(s["bot"]), "Zone high": fp(s["top"]),
+                "Dist %": round(s["dist"], 2), "Candles ago": s["age"], "Pivots": s["pivots"],
+            } for s in shown]), hide_index=True, width="stretch")
+        else:
+            st.info("Ippudu e coin lo trendline wick touch ledu. Auto-refresh avtune untundi.")
+
+        # ── Signal 2: 1m sweep at the same-timeframe trendline ──
+        if cfg["sweep"]:
+            st.subheader(f"⚡ Signal 2 · 1m sweep at trendline ({len(sweeps)})")
+            st.caption(f"1m candles checked for {n_cand} coins that are near a trendline zone. "
+                       "Zone TF = the timeframe of the trendline that got swept.")
+            if sweeps:
+                st.dataframe(pd.DataFrame([{
+                    "Coin": s["coin"], "Zone TF": s["tf"], "Signal": s["signal"],
+                    "Price": fp(s["price"]), "Zone low": fp(s["bot"]), "Zone high": fp(s["top"]),
+                    "Overshoot %": round(s["over"], 3), "Wick %": round(s["wick"]),
+                    "1m candles ago": s["age"],
+                } for s in sweeps]), hide_index=True, width="stretch")
+            else:
+                st.info("Ippudu 1m sweep ledu. Auto-refresh avtune untundi.")
 
         log = st.session_state.get("log")
         if log:
             with st.expander(f"Alert history ({len(log)})", expanded=False):
                 st.dataframe(pd.DataFrame(log), hide_index=True, width="stretch")
 
-        shown = [s for s in sigs if show_repeat or s["status"] != "REPEAT"]
-        if not shown:
-            st.info("Ippudu e coin lo trendline wick touch ledu. Auto-refresh avtune untundi.")
-            return
-
-        label = {"FRESH": "\U0001F525 FRESH", "BREAKOUT": "\U0001F680 BREAKOUT", "REPEAT": "REPEAT"}
-        df = pd.DataFrame([{
-            "Status": label[s["status"]], "Coin": s["coin"], "TF": s["tf"],
-            "Signal": s["signal"], "Price": fp(s["price"]),
-            "Zone low": fp(s["bot"]), "Zone high": fp(s["top"]),
-            "Dist %": round(s["dist"], 2), "Candles ago": s["age"], "Pivots": s["pivots"],
-        } for s in shown])
-        st.dataframe(df, hide_index=True, width="stretch")
-
-        with st.expander("Chart", expanded=False):
-            opts = {f"{s['coin']} · {s['tf']} · {s['signal']}": s for s in shown[:60]}
-            pick = st.selectbox("Signal", list(opts), key="chart_pick")
-            sel = opts.get(pick)
-            if sel:
-                d = get_klines(base, store, sel["symbol"], sel["tf"])
-                if d is not None:
-                    st.plotly_chart(make_chart(d, sel["tf"], cfg), width="stretch")
+        opts = {f"Touch · {s['coin']} · {s['tf']} · {s['signal']}": s for s in shown[:40]}
+        opts.update({f"Sweep · {s['coin']} · {s['tf']} · {s['signal']}": s for s in sweeps[:40]})
+        if opts:
+            with st.expander("Chart", expanded=False):
+                pick = st.selectbox("Signal", list(opts), key="chart_pick")
+                sel = opts.get(pick)
+                if sel:
+                    d = get_klines(base, store, sel["symbol"], sel["tf"])
+                    if d is not None:
+                        st.plotly_chart(make_chart(d, sel["tf"], cfg), width="stretch")
 
     live()
 
