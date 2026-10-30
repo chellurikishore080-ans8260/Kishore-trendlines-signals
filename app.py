@@ -5,8 +5,9 @@ Author: Kishore
 Scans every Binance Spot USDT pair on 5m / 15m / 30m / 1h / 4h and builds the
 nearest support / resistance trendline zone for each coin. Two separate signals:
   1. Touch  - a candle wick touches the zone on its own timeframe.
-  2. Sweep  - a 1-minute candle sweeps (wick beyond the zone edge, closes back)
-              near that same-timeframe zone.
+  2. Volume - a closed candle on the zone's own timeframe reacts at the zone with
+              good volume (a same-timeframe liquidity sweep is fine).
+  3. Sweep  - (optional) a 1-minute candle sweeps near that same-timeframe zone.
 The screen refreshes itself - no manual scan, no sidebar.
 
 Zone logic follows the open-source "Trendlines" Pine indicator (MPL-2.0),
@@ -150,6 +151,7 @@ def fetch_klines(base, symbol, tf, limit=KLINES, min_len=60):
         "h": np.array([float(x[2]) for x in d]),
         "l": np.array([float(x[3]) for x in d]),
         "c": np.array([float(x[4]) for x in d]),
+        "v": np.array([float(x[5]) for x in d]),
     }
 
 
@@ -279,22 +281,77 @@ def touch_series(z, h, l, idxs, pierce):
     return t
 
 
+VOL_MA = 20  # volume average length (candles before the signal candle)
+
+
+def vol_signals(d, z, key, sym, tf, cfg, atr):
+    """Signal 2: a CLOSED candle on the zone's own timeframe reacts at the zone
+    with real volume.
+
+    Support zone  -> long reaction : wick reaches the zone, candle closes back at/above
+                     the zone bottom, in the upper part of its range.
+    Resistance    -> short reaction: mirror image.
+    A same-timeframe liquidity sweep is fine: the wick may poke through the far edge
+    by up to `vol_pierce` x ATR as long as the candle closes back on the right side.
+    Volume must be >= `vol_mult` x the average of the previous 20 candles.
+    """
+    o, h, l, c, v, t = d["o"], d["h"], d["l"], d["c"], d["v"], d["t"]
+    last = len(c) - 1                 # the last bar is still forming: not used
+    res = key == "res"
+    out = []
+    for i in range(max(VOL_MA, last - cfg["vol_win"]), last):
+        base = float(v[i - VOL_MA:i].mean())
+        rng = float(h[i] - l[i])
+        if base <= 0 or rng <= 0:
+            continue
+        rvol = float(v[i]) / base
+        if rvol < cfg["vol_mult"]:
+            continue
+        top, bot = zone_at(z, i)
+        if res:
+            if not (o[i] <= top and h[i] >= bot and c[i] <= top):
+                continue
+            pierce = max(float(h[i]) - top, 0.0)
+            strength = float(h[i] - c[i]) / rng * 100
+        else:
+            if not (o[i] >= bot and l[i] <= top and c[i] >= bot):
+                continue
+            pierce = max(bot - float(l[i]), 0.0)
+            strength = float(c[i] - l[i]) / rng * 100
+        if pierce > cfg["vol_pierce"] * atr or strength < cfg["vol_close"]:
+            continue
+        entry = float(c[i])
+        sl = float(h[i]) if res else float(l[i])
+        out.append(dict(
+            status="VOLUME", coin=sym[:-4], symbol=sym, tf=tf, kind=key,
+            signal="Resistance reaction ↓" if res else "Support reaction ↑",
+            price=float(c[-1]), bot=float(bot), top=float(top), dist=0.0,
+            rvol=rvol, strength=float(strength), swept=pierce > 0,
+            entry=entry, sl=sl, risk=abs(entry - sl) / entry * 100,
+            age=int(last - i), pivots=z["touches"], bar=int(t[i]),
+        ))
+    return out
+
+
 def analyze(sym, tf, d, cfg):
-    """Returns (touch/breakout rows, zone infos used later for the 1m sweep check)."""
+    """Returns (touch/breakout rows, zone infos for the 1m sweep check, volume rows)."""
     zones = compute_zones(d, cfg)
     if not zones:
-        return [], []
+        return [], [], []
     h, l, c, t = d["h"], d["l"], d["c"], d["t"]
     last = len(c) - 1
     W = cfg["window"]
     cd = cfg["cooldown"].get(tf, 5)
     price = float(c[-1])
     coin = sym[:-4]
-    rows, zinfos = [], []
+    atr = atr_last(h, l, c)
+    rows, zinfos, vrows = [], [], []
     for key, z in zones.items():
         if not z:
             continue
         res = key == "res"
+        if cfg["vol"]:
+            vrows.extend(vol_signals(d, z, key, sym, tf, cfg, atr))
         top, bot = zone_at(z, last)
         if price > top:
             dist = (price - top) / price * 100
@@ -336,11 +393,11 @@ def analyze(sym, tf, d, cfg):
                 rows.append(row("BREAKOUT", "Resistance breakout ↑", 0, last))
             if (not res) and c[-1] < bot and c[-2] >= bot_p:
                 rows.append(row("BREAKOUT", "Support breakdown ↓", 0, last))
-    return rows, zinfos
+    return rows, zinfos, vrows
 
 
 def scan_all(base, store, symbols, tfs, cfg, workers=16):
-    sigs, zinfos, ok, fail = [], [], 0, 0
+    sigs, vsigs, zinfos, ok, fail = [], [], [], 0, 0
 
     def job(sym, tf):
         d = get_klines(base, store, sym, tf)
@@ -361,12 +418,14 @@ def scan_all(base, store, symbols, tfs, cfg, workers=16):
                 ok += 1
                 sigs.extend(r[0])
                 zinfos.extend(r[1])
+                vsigs.extend(r[2])
     order = {"FRESH": 0, "BREAKOUT": 1, "REPEAT": 2}
     sigs.sort(key=lambda x: (order[x["status"]], x["age"], x["dist"]))
-    return sigs, zinfos, ok, fail
+    vsigs.sort(key=lambda x: (x["age"], -x["rvol"]))  # newest first, strongest volume first
+    return sigs, vsigs, zinfos, ok, fail
 
 
-# ───────────────────── Signal 2: 1-minute sweep at the zone ─────────────────────
+# ───────────────── Signal 3 (optional): 1-minute sweep at the zone ─────────────────
 def find_sweeps(m, zinfos, cfg):
     """1m sweep candles against the HTF zones of one coin.
 
@@ -446,12 +505,14 @@ def scan_sweeps(base, zinfos, cfg, workers=16):
 
 
 # ───────────────────────────── Alerts ─────────────────────────────
-@lru_cache(maxsize=2)
+@lru_cache(maxsize=3)
 def beep_wav(kind="touch"):
-    """Two different tones so you can tell the signals apart without looking."""
+    """Different tones so you can tell the signals apart without looking."""
     notes = ((880, 0.18), (1175, 0.18), (880, 0.18))          # touch
     if kind == "sweep":
         notes = ((1320, 0.12), (1760, 0.12), (1320, 0.12), (1760, 0.12))
+    elif kind == "vol":                                       # rising chime
+        notes = ((1047, 0.15), (1319, 0.15), (1568, 0.30))
     sr = 22050
     buf = io.BytesIO()
     with wave.open(buf, "wb") as w:
@@ -497,6 +558,13 @@ def fp(x):
 
 
 def alert_text(s):
+    if s["status"] == "VOLUME":
+        return (
+            f"\U0001F3AF {s['signal']} (volume candle)\n{s['symbol']} · {s['tf']} trendline\n"
+            f"Entry {fp(s['entry'])} | SL {fp(s['sl'])} ({s['risk']:.2f}%) | "
+            f"Vol {s['rvol']:.1f}x | {'Sweep' if s['swept'] else 'Touch'}\n"
+            f"Zone {fp(s['bot'])} - {fp(s['top'])}"
+        )
     if s["status"] == "SWEEP":
         return (
             f"⚡ {s['signal']} (1m sweep)\n{s['symbol']} · {s['tf']} trendline\n"
@@ -580,8 +648,17 @@ def main():
         for col, tf in zip(st.columns(max(len(tfs), 1)), tfs):
             cooldown[tf] = col.number_input(tf, 1, 50, 5, key=f"cd_{tf}")
 
-        st.markdown("**Signal 2 · 1-minute sweep at the trendline**")
-        sweep_on = st.checkbox("Enable 1m sweep signal", True)
+        st.markdown("**Signal 2 · Volume candle at the trendline (same timeframe)**")
+        vol_on = st.checkbox("Enable volume signal", True)
+        vol_mult = st.slider("Min volume vs 20-candle average (×)", 1.0, 5.0, 1.5, 0.1)
+        vol_close = st.slider(
+            "Min close strength (% of candle range, away from the zone)", 0, 90, 50, 5)
+        vol_pierce = st.slider(
+            "Max wick through the zone, same-TF sweep allowed (× ATR)", 0.0, 2.0, 1.0, 0.1)
+        vol_win = st.slider("Check last N closed candles", 1, 5, 2)
+
+        st.markdown("**Signal 3 (optional) · 1-minute sweep at the trendline**")
+        sweep_on = st.checkbox("Enable 1m sweep signal", False)
         sweep_cap = st.slider("Max wick overshoot beyond the zone (%)", 0.05, 2.0, 0.5, 0.05)
         sweep_wick = st.slider("Min sweep wick (% of the 1m candle)", 0, 80, 20, 5)
         sweep_win = st.slider("Check last N closed 1m candles", 1, 10, 3)
@@ -608,6 +685,8 @@ def main():
         window=window, cooldown=cooldown, pierce=pierce, breakouts=breakouts,
         sweep=sweep_on, sweep_cap=sweep_cap, sweep_wick=sweep_wick,
         sweep_win=sweep_win, sweep_forming=sweep_forming,
+        vol=vol_on, vol_mult=vol_mult, vol_close=vol_close, vol_pierce=vol_pierce,
+        vol_win=vol_win,
     )
 
     store = kline_store()
@@ -639,12 +718,12 @@ def main():
         if cache and cache["sig"] == sig and time.time() - cache["ts"] < refresh * 0.9:
             # the chart picker (a widget inside this fragment) reran it: reuse the
             # last scan instead of hitting Binance again
-            sigs, sweeps, n_cand, fail, took, scanned_at = (
-                cache["sigs"], cache["sweeps"], cache["n_cand"], cache["fail"],
-                cache["took"], cache["at"])
+            sigs, vsigs, sweeps, n_cand, fail, took, scanned_at = (
+                cache["sigs"], cache["vsigs"], cache["sweeps"], cache["n_cand"],
+                cache["fail"], cache["took"], cache["at"])
         else:
             t0 = time.time()
-            sigs, zinfos, ok, fail = scan_all(base, store, symbols, tfs, cfg)
+            sigs, vsigs, zinfos, ok, fail = scan_all(base, store, symbols, tfs, cfg)
             if ok == 0:
                 st.error("Ekkada nundi kuda candles raaledu (Binance block / rate limit).")
                 return
@@ -655,20 +734,26 @@ def main():
             took = time.time() - t0
             scanned_at = datetime.now(IST).strftime("%H:%M:%S")
             st.session_state["scan_cache"] = dict(
-                sig=sig, ts=t0, sigs=sigs, sweeps=sweeps, n_cand=n_cand,
+                sig=sig, ts=t0, sigs=sigs, vsigs=vsigs, sweeps=sweeps, n_cand=n_cand,
                 fail=fail, took=took, at=scanned_at)
 
-            # alerts: new touches / breakouts (signal 1) and new 1m sweeps (signal 2)
+            # alerts: new touches / breakouts (signal 1), volume candles (signal 2)
+            # and new 1m sweeps (signal 3)
             seen = st.session_state.setdefault("seen", set())
             first_run = "seen_init" not in st.session_state
             st.session_state["seen_init"] = True
-            new_t, new_s = [], []
+            new_t, new_v, new_s = [], [], []
             for s in sigs:
                 key = f"{s['symbol']}|{s['tf']}|{s['signal']}|{s['bar']}"
                 if key not in seen:
                     seen.add(key)
                     if s["status"] in ("FRESH", "BREAKOUT"):
                         new_t.append(s)
+            for s in vsigs:
+                key = f"V|{s['symbol']}|{s['tf']}|{s['kind']}|{s['bar']}"
+                if key not in seen:
+                    seen.add(key)
+                    new_v.append(s)
             for s in sweeps:
                 key = f"S|{s['symbol']}|{s['tf']}|{s['kind']}|{s['bar']}"
                 if key not in seen:
@@ -676,10 +761,12 @@ def main():
                     new_s.append(s)
             if len(seen) > 5000:
                 seen.clear()
-            new = new_s + new_t
+            new = new_v + new_s + new_t
             if new and not first_run:
-                kinds = {"SWEEP": "⚡ Sweep 1m", "FRESH": "\U0001F525 Touch",
-                         "BREAKOUT": "\U0001F680 Breakout"}
+                kinds = {"VOLUME": "\U0001F3AF Volume", "SWEEP": "⚡ Sweep 1m",
+                         "FRESH": "\U0001F525 Touch", "BREAKOUT": "\U0001F680 Breakout"}
+                icons = {"VOLUME": "\U0001F3AF", "SWEEP": "⚡",
+                         "FRESH": "\U0001F525", "BREAKOUT": "\U0001F680"}
                 log = st.session_state.setdefault("log", [])
                 for s in reversed(new):
                     log.insert(0, {
@@ -689,10 +776,10 @@ def main():
                 del log[100:]
                 if sound:
                     for s in new[:6]:
-                        icon = "⚡" if s["status"] == "SWEEP" else "\U0001F525"
-                        st.toast(f"{s['signal']}  {s['symbol']} {s['tf']}", icon=icon)
-                    st.audio(beep_wav("sweep" if new_s else "touch"),
-                             format="audio/wav", autoplay=True)
+                        st.toast(f"{s['signal']}  {s['symbol']} {s['tf']}",
+                                 icon=icons[s["status"]])
+                    tone = "vol" if new_v else ("sweep" if new_s else "touch")
+                    st.audio(beep_wav(tone), format="audio/wav", autoplay=True)
                 send_telegram(tg_token, tg_chat, "\n\n".join(alert_text(s) for s in new[:15]))
 
         st.caption(
@@ -716,9 +803,29 @@ def main():
         else:
             st.info("Ippudu e coin lo trendline wick touch ledu. Auto-refresh avtune untundi.")
 
-        # ── Signal 2: 1m sweep at the same-timeframe trendline ──
+        # ── Signal 2: volume candle at the trendline (same timeframe) ──
+        if cfg["vol"]:
+            st.subheader(f"\U0001F3AF Signal 2 · Volume candle at trendline ({len(vsigs)})")
+            st.caption(
+                "Closed candle on the trendline's own timeframe reacts at the zone with "
+                f"≥ {cfg['vol_mult']:.1f}× average volume. A wick through the zone (liquidity "
+                "sweep) is fine if the candle closes back. Entry = candle close, SL = candle "
+                "low/high.")
+            if vsigs:
+                st.dataframe(pd.DataFrame([{
+                    "Coin": s["coin"], "TF": s["tf"], "Signal": s["signal"],
+                    "Type": "Sweep + volume" if s["swept"] else "Touch + volume",
+                    "Vol ×avg": round(s["rvol"], 1), "Close %": round(s["strength"]),
+                    "Entry": fp(s["entry"]), "SL": fp(s["sl"]), "Risk %": round(s["risk"], 2),
+                    "Zone low": fp(s["bot"]), "Zone high": fp(s["top"]),
+                    "Candles ago": s["age"], "Price now": fp(s["price"]),
+                } for s in vsigs]), hide_index=True, width="stretch")
+            else:
+                st.info("Ippudu volume tho trendline reaction candle ledu. Auto-refresh avtune untundi.")
+
+        # ── Signal 3 (optional): 1m sweep at the same-timeframe trendline ──
         if cfg["sweep"]:
-            st.subheader(f"⚡ Signal 2 · 1m sweep at trendline ({len(sweeps)})")
+            st.subheader(f"⚡ Signal 3 · 1m sweep at trendline ({len(sweeps)})")
             st.caption(f"1m candles checked for {n_cand} coins that are near a trendline zone. "
                        "Zone TF = the timeframe of the trendline that got swept.")
             if sweeps:
@@ -737,6 +844,7 @@ def main():
                 st.dataframe(pd.DataFrame(log), hide_index=True, width="stretch")
 
         opts = {f"Touch · {s['coin']} · {s['tf']} · {s['signal']}": s for s in shown[:40]}
+        opts.update({f"Volume · {s['coin']} · {s['tf']} · {s['signal']}": s for s in vsigs[:40]})
         opts.update({f"Sweep · {s['coin']} · {s['tf']} · {s['signal']}": s for s in sweeps[:40]})
         if opts:
             with st.expander("Chart", expanded=False):
