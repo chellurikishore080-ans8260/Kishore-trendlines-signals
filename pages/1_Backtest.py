@@ -104,7 +104,18 @@ cfg = dict(
     sl_mode="candle" if sl_label.startswith("Signal") else "zone",
 )
 
-if st.button("▶ Run backtest", type="primary", width="stretch"):
+
+
+# Run trigger = a checkbox that resets itself (acts like a button). st.button needs a
+# separate Button.js file in the browser, which some phones/blockers fail to load.
+def _arm_run():
+    st.session_state["_go"] = True
+    st.session_state["run_bt"] = False
+
+
+st.checkbox("▶ RUN BACKTEST - ikkada tick cheyandi", key="run_bt", on_change=_arm_run)
+
+if st.session_state.pop("_go", False):
     base, err = sc.find_base()
     if base is None:
         st.error("Binance data fetch avvaledu. " + err)
@@ -140,7 +151,7 @@ if st.button("▶ Run backtest", type="primary", width="stretch"):
 
 R = st.session_state.get("bt")
 if not R:
-    st.info("**Run backtest** nokkandi (default: 1 lakh capital). Win rate + PnL results ikkada separate tabs lo vastayi.")
+    st.info("**RUN BACKTEST** tick cheyandi (default: 1 lakh capital). Win rate + PnL results ikkada separate tabs lo vastayi.")
     st.stop()
 
 df, cfg = R["df"], R["cfg"]
@@ -242,8 +253,4 @@ for tab, k in zip(tabs[1:], R["chosen"]):
         })
         st.markdown(f"**All trades ({len(view)}) - newest first**")
         st.dataframe(view, hide_index=True, width="stretch")
-        st.download_button(
-            "⬇ Download trades CSV",
-            sub.drop(columns=["_t_in", "_t_out"]).to_csv(index=False).encode(),
-            file_name=f"trendline_backtest_{k}.csv", mime="text/csv", key=f"dl_{k}",
-        )
+        st.caption("CSV kavalante: table paina hover chesi (top-right) download icon nokkandi.")
