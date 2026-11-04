@@ -24,7 +24,9 @@ st.caption(
 D = bt.DEFAULTS
 TF_OPTIONS = sc.TF_OPTIONS
 
-with st.expander("⚙️ Backtest settings", expanded=True):
+st.page_link("app.py", label="Back to Scanner", icon="\U0001F4C8")
+
+with st.expander("⚙️ Backtest settings (default: 1 lakh capital, 50% per trade)", expanded=False):
     c1, c2 = st.columns(2)
     n_coins = c1.slider("Coins: top N by 24h volume", 3, 60, 15)
     manual = c2.text_input("Or specific coins (comma separated, e.g. BTC,ETH,SOL)", "")
@@ -138,7 +140,7 @@ if st.button("▶ Run backtest", type="primary", width="stretch"):
 
 R = st.session_state.get("bt")
 if not R:
-    st.info("Settings chusi **Run backtest** nokkandi. Results ikkada separate tabs lo vastayi.")
+    st.info("**Run backtest** nokkandi (default: 1 lakh capital). Win rate + PnL results ikkada separate tabs lo vastayi.")
     st.stop()
 
 df, cfg = R["df"], R["cfg"]
@@ -165,8 +167,9 @@ for k in R["chosen"]:
     rows.append(s)
 with tabs[0]:
     cmp = pd.DataFrame(rows)[[
-        "Backtest", "Trades", "Success", "Failed", "Timeout", "Success %", "Profitable %",
-        "Avg R", "Avg R (no fees)", "Total R", "Profit factor", "Net PnL", "Max DD", "Open"]]
+        "Backtest", "Trades", "Success", "Failed", "Timeout", "Win rate %", "Net PnL",
+        "Return %", "Final capital", "Profit factor", "Profitable %",
+        "Avg R", "Avg R (no fees)", "Total R", "Max DD", "Open"]]
     st.dataframe(cmp, hide_index=True, width="stretch")
     st.caption("Open = trades still running at the end of the data (not counted).")
 
@@ -193,11 +196,14 @@ for tab, k in zip(tabs[1:], R["chosen"]):
             st.info("E settings tho e backtest lo trades raaledu. Candles/coins penchandi leda settings loosen cheyandi.")
             continue
         s = bt.summarize(sub, cfg)
-        m = st.columns(4)
+        m = st.columns(3)
         m[0].metric("Trades", s["Trades"], f"{s['Success']}✅ {s['Failed']}❌ {s['Timeout']}⏱")
-        m[1].metric("Success %", f"{s['Success %']}%")
-        m[2].metric("Net PnL", f"{s['Net PnL']:,.0f}")
-        m[3].metric("Profit factor", s["Profit factor"])
+        m[1].metric("Win rate", f"{s['Win rate %']}%")
+        m[2].metric("Profit factor", s["Profit factor"])
+        m = st.columns(3)
+        m[0].metric(f"Net PnL (on {cfg['capital']:,.0f})", f"{s['Net PnL']:,.0f}")
+        m[1].metric("Return", f"{s['Return %']}%")
+        m[2].metric("Final capital", f"{s['Final capital']:,.0f}")
 
         closed = sub[sub["Result"] != "OPEN"].sort_values("_t_out")
         if not closed.empty:
@@ -216,7 +222,7 @@ for tab, k in zip(tabs[1:], R["chosen"]):
                       Failed=("Result", lambda x: int((x == "Failed").sum())),
                       AvgR=("R", "mean"), PnL=("PnL", "sum"))
                  .reset_index())
-            g["Success %"] = (g["Success"] / g["Trades"] * 100).round(1)
+            g["Win rate %"] = (g["Success"] / g["Trades"] * 100).round(1)
             g["AvgR"] = g["AvgR"].round(2)
             g["PnL"] = g["PnL"].round(0)
             with st.expander(f"By {'timeframe' if by == 'TF' else 'coin'}", expanded=(by == "TF")):

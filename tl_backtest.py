@@ -530,9 +530,11 @@ def summarize(df, cfg):
     """Stats of one strategy's trades (OPEN trades are not counted)."""
     closed = df[df["Result"] != "OPEN"]
     n = len(closed)
-    out = dict(Trades=n, Success=0, Failed=0, Timeout=0, **{"Success %": 0.0},
+    cap = float(cfg["capital"])
+    out = dict(Trades=n, Success=0, Failed=0, Timeout=0, **{"Win rate %": 0.0},
                **{"Profitable %": 0.0}, **{"Avg R": 0.0}, **{"Avg R (no fees)": 0.0}, **{"Total R": 0.0},
-               **{"Profit factor": 0.0}, **{"Net PnL": 0.0}, **{"Max DD": 0.0},
+               **{"Profit factor": 0.0}, **{"Net PnL": 0.0}, **{"Return %": 0.0},
+               **{"Final capital": cap}, **{"Max DD": 0.0},
                Open=int((df["Result"] == "OPEN").sum()))
     if n == 0:
         return out
@@ -543,13 +545,15 @@ def summarize(df, cfg):
         "Success": int((closed["Result"] == "Success").sum()),
         "Failed": int((closed["Result"] == "Failed").sum()),
         "Timeout": int((closed["Result"] == "Timeout").sum()),
-        "Success %": round((closed["Result"] == "Success").mean() * 100, 1),
+        "Win rate %": round((closed["Result"] == "Success").mean() * 100, 1),
         "Profitable %": round((pnl > 0).mean() * 100, 1),
         "Avg R": round(float(closed["R"].mean()), 2),
         "Avg R (no fees)": round(float(closed["R_gross"].mean()), 2),
         "Total R": round(float(closed["R"].sum()), 1),
         "Profit factor": round(float(gp / gl), 2) if gl > 0 else float("inf") if gp > 0 else 0.0,
         "Net PnL": round(float(pnl.sum()), 0),
+        "Return %": round(float(pnl.sum()) / cap * 100, 2),
+        "Final capital": round(cap + float(pnl.sum()), 0),
         "Max DD": round(float((eq.cummax() - eq).max()), 0),
     })
     return out

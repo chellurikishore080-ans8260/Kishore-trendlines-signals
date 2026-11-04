@@ -671,6 +671,10 @@ def main():
     )
     st.title("\U0001F4C8 Trendline Zone Scanner")
     st.caption("Binance Spot · all USDT pairs · auto scan · by Kishore")
+    st.page_link(
+        "pages/1_Backtest.py", icon="\U0001F9EA",
+        label="Backtest - 1 lakh capital, win rate + PnL for every signal",
+    )
 
     # No sidebar and no scan button: scanning starts by itself with these defaults.
     with st.expander("⚙️ Settings (optional - scan automatic ga run avtundi)", expanded=False):
