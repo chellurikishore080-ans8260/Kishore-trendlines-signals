@@ -24,7 +24,7 @@ One open trade at a time per coin + timeframe + strategy.
 """
 
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 
 import numpy as np
 import pandas as pd
@@ -107,6 +107,19 @@ def fetch_history(base, symbol, tf, total):
     }
 
 
+_HIST = {}   # (symbol, tf) -> candles, downloaded once per run and shared by every strategy
+PROG = {"done": 0, "total": 0}   # zone bars computed so far (read by the progress bar)
+LAST = {}    # diagnostics of the last run (download counts, first errors)
+
+
+def get_hist(base, sym, tf, total):
+    """Candles from the per-run cache (downloaded once); straight from Binance if not cached."""
+    if (sym, tf) in _HIST:
+        d = _HIST[(sym, tf)]
+        return None if d is None else {k: v[-total:] for k, v in d.items()}
+    return fetch_history(base, sym, tf, total)
+
+
 # ───────────────────────────── zones, bar by bar ─────────────────────────────
 def _shift(z, off):
     if not z:
@@ -123,6 +136,7 @@ def build_zones(d, cfg, start, end=None):
     end = n if end is None else end
     out = [None] * n
     for i in range(start, end):
+        PROG["done"] += 1
         s0 = max(0, i + 1 - ZW)
         sl = {k: d[k][s0:i + 1] for k in ("h", "l", "c")}
         z = sc.compute_zones(sl, cfg)
@@ -453,7 +467,7 @@ def make_trades(d, sigs, cfg, step, atr_at, sl_mode, max_hold, meta):
 # ───────────────────────────── jobs ─────────────────────────────
 def job_main(base, sym, tf, n_test, cfg, strats):
     """Strategies 1, 2, 3, 5 on one coin + timeframe (shared zone computation)."""
-    d = fetch_history(base, sym, tf, n_test + ZW)
+    d = get_hist(base, sym, tf, n_test + ZW)
     if d is None:
         return None
     n = len(d["c"])
@@ -486,14 +500,14 @@ def job_main(base, sym, tf, n_test, cfg, strats):
 
 def job_sweep(base, sym, tfs, n_1m, cfg):
     """Strategy 4 on one coin: 1m candles against each higher-timeframe zone."""
-    m = fetch_history(base, sym, "1m", n_1m)
+    m = get_hist(base, sym, "1m", n_1m)
     if m is None:
         return None
     trades = []
     for tf in tfs:
         step = STEP[tf]
         need = int(np.ceil(len(m["c"]) * 60_000 / step)) + 10
-        d = fetch_history(base, sym, tf, need + ZW)
+        d = get_hist(base, sym, tf, need + ZW)
         if d is None:
             continue
         j0 = max(60, int(np.searchsorted(d["t"], int(m["t"][0]) - step, side="left")) - 1)
@@ -507,36 +521,117 @@ def job_sweep(base, sym, tfs, n_1m, cfg):
     return dict(trades=trades, candles=len(m["c"]))
 
 
+def net_note():
+    """Short text about Binance health: HTTP status counts and any rate-limit pause."""
+    stats = getattr(sc, "HTTP_STATS", {})
+    parts = [f"HTTP ok {stats.get(200, 0)}"]
+    bad = {k: v for k, v in stats.items() if k != 200}
+    if bad:
+        parts.append("problems " + ", ".join(f"{k}x{v}" for k, v in bad.items()))
+    wait_s = sc._pause_until - time.time()
+    if wait_s > 1:
+        parts.append(f"rate-limit pause {wait_s:.0f}s")
+    return " | ".join(parts)
+
+
 def run_backtest(base, symbols, tfs, n_test, cfg, strats, n_1m=4000, workers=6,
-                 progress=None):
-    """Runs everything; returns (DataFrame of all trades, failed job count)."""
-    jobs = []
+                 progress=None, status=None):
+    """Runs everything; returns (DataFrame of all trades, failed job count).
+
+    Phase 1 downloads every (coin, timeframe) once (shared by all strategies).
+    Phase 2 tests. status(text, fraction) is called about twice a second the whole time,
+    progress(done, total) after every finished job (older callers)."""
+    t0 = time.time()
+    say = status or (lambda text, frac: None)
     main_strats = [s for s in strats if s != "sweep"]
-    ex = ThreadPoolExecutor(max_workers=workers)
+    use_sweep = "sweep" in strats
+    need = {}
+    for s in symbols:
+        if main_strats:
+            for tf in tfs:
+                need[(s, tf)] = max(need.get((s, tf), 0), n_test + ZW)
+        if use_sweep:
+            need[(s, "1m")] = n_1m
+            for tf in tfs:
+                bars = int(np.ceil(n_1m * 60_000 / STEP[tf])) + 10
+                need[(s, tf)] = max(need.get((s, tf), 0), bars + ZW)
+    _HIST.clear()
+    sc.HTTP_STATS.clear()
+    PROG["done"], PROG["total"] = 0, 1
+    LAST.clear()
+    errors = []
+    dl_ex = ThreadPoolExecutor(max_workers=4)
+    comp_ex = None
     try:
+        # ── phase 1: download ──
+        futs = {dl_ex.submit(fetch_history, base, s, tf, tot): (s, tf)
+                for (s, tf), tot in need.items()}
+        pending, n_dl, dl_fail = set(futs), 0, 0
+        say("Downloading candles 0/%d" % len(futs), 0.0)
+        while pending:
+            fin, pending = wait(pending, timeout=0.4)
+            for f in fin:
+                try:
+                    d = f.result()
+                except Exception as e:  # noqa: BLE001
+                    d = None
+                    errors.append(f"download: {e!r}")
+                _HIST[futs[f]] = d
+                n_dl += 1
+                dl_fail += d is None
+            say(f"Downloading candles {n_dl}/{len(futs)} | {time.time() - t0:.0f}s | {net_note()}",
+                0.3 * n_dl / len(futs))
+        LAST.update(downloads=len(futs), download_fail=dl_fail, net=net_note(), errors=errors)
+        if dl_fail == len(futs):
+            return finish([], cfg), dl_fail
+
+        # ── phase 2: test ──
+        total_bars = 0
+        for s in symbols:
+            for tf in tfs:
+                d, m = _HIST.get((s, tf)), _HIST.get((s, "1m"))
+                if main_strats and d is not None:
+                    total_bars += min(n_test, len(d["c"]) - 60)
+                if use_sweep and d is not None and m is not None:
+                    total_bars += int(np.ceil(len(m["c"]) * 60_000 / STEP[tf])) + 10
+        PROG["done"], PROG["total"] = 0, max(total_bars, 1)
+        comp_ex = ThreadPoolExecutor(max_workers=workers)
+        cf = []
         if main_strats:
             for s in symbols:
                 for tf in tfs:
-                    jobs.append(ex.submit(job_main, base, s, tf, n_test, cfg, main_strats))
-        if "sweep" in strats:
+                    if _HIST.get((s, tf)) is not None:
+                        cf.append(comp_ex.submit(job_main, base, s, tf, n_test, cfg, main_strats))
+        if use_sweep:
             for s in symbols:
-                jobs.append(ex.submit(job_sweep, base, s, tfs, n_1m, cfg))
-        rows, fail, done = [], 0, 0
-        for f in as_completed(jobs):
-            done += 1
-            try:
-                r = f.result()
-            except Exception:
-                r = None
-            if r is None:
-                fail += 1
-            else:
-                rows += r["trades"]
-            if progress:
-                progress(done, len(jobs))
+                if _HIST.get((s, "1m")) is not None:
+                    cf.append(comp_ex.submit(job_sweep, base, s, tfs, n_1m, cfg))
+        pending, rows, fail, n_done = set(cf), [], dl_fail, 0
+        while pending:
+            fin, pending = wait(pending, timeout=0.4)
+            for f in fin:
+                n_done += 1
+                try:
+                    r = f.result()
+                except Exception as e:  # noqa: BLE001
+                    r = None
+                    errors.append(f"test: {e!r}")
+                if r is None:
+                    fail += 1
+                else:
+                    rows += r["trades"]
+                if progress:
+                    progress(n_done, len(cf))
+            frac = min(1.0, PROG["done"] / PROG["total"])
+            say(f"Testing {PROG['done']:,}/{PROG['total']:,} candles | jobs {n_done}/{len(cf)} | "
+                f"{time.time() - t0:.0f}s", 0.3 + 0.7 * frac)
+        LAST.update(errors=errors)
+        return finish(rows, cfg), fail
     finally:
-        ex.shutdown(wait=False)
-    return finish(rows, cfg), fail
+        dl_ex.shutdown(wait=False, cancel_futures=True)
+        if comp_ex is not None:
+            comp_ex.shutdown(wait=False, cancel_futures=True)
+        _HIST.clear()
 
 
 def finish(rows, cfg):

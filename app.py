@@ -94,6 +94,13 @@ _session.mount(
 _pause_until = 0.0  # shared by all worker threads: no request before this time
 
 
+HTTP_STATS = {}  # HTTP status code -> count (diagnostics shown on the backtest page)
+
+
+def _count(key):
+    HTTP_STATS[key] = HTTP_STATS.get(key, 0) + 1
+
+
 def _throttle():
     wait = _pause_until - time.time()
     if wait > 0:
@@ -106,6 +113,7 @@ def http_get(base, path, params=None, tries=3):
         _throttle()
         try:
             r = _session.get(base + path, params=params, timeout=12)
+            _count(r.status_code)
             used = r.headers.get("x-mbx-used-weight-1m", "")
             if used.isdigit() and int(used) >= 5400:
                 # close to Binance's 6000/min limit: wait for the next minute
@@ -123,6 +131,7 @@ def http_get(base, path, params=None, tries=3):
             if r.status_code == 451:  # region blocked on this host
                 return None
         except requests.RequestException:
+            _count("err")
             time.sleep(0.5 * (attempt + 1))
     return None
 

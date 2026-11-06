@@ -26,7 +26,7 @@ TF_OPTIONS = sc.TF_OPTIONS
 
 with st.expander("⚙️ Backtest settings", expanded=True):
     c1, c2 = st.columns(2)
-    n_coins = c1.slider("Coins: top N by 24h volume", 3, 60, 15)
+    n_coins = c1.slider("Coins: top N by 24h volume", 3, 60, 10)
     manual = c2.text_input("Or specific coins (comma separated, e.g. BTC,ETH,SOL)", "")
     tfs = st.multiselect("Zone timeframes", TF_OPTIONS, default=["15m", "1h"])
     c1, c2, c3 = st.columns(3)
@@ -130,18 +130,35 @@ if st.button("▶ Run backtest", type="primary", width="stretch"):
         vols = sc.load_volumes(base)
         symbols = sorted(symbols, key=lambda s: -vols.get(s, 0))[:n_coins]
 
+    # quick Binance check first: a block / rate limit shows up at once instead of a silent wait
+    chk = st.empty()
+    chk.info("Binance check chestunna...")
+    sc.HTTP_STATS.clear()
+    t_probe = time.time()
+    probe = sc.http_get(base, "/api/v3/klines",
+                        {"symbol": symbols[0], "interval": "15m", "limit": 5})
+    if not probe:
+        chk.error(
+            f"Binance nundi candles raaledu ({base.split('//')[1]}). "
+            f"HTTP status: {dict(sc.HTTP_STATS) or 'no response'}. "
+            "1-2 nimishalu aagi malli try cheyandi. Scanner tab open lo unte adi kuda "
+            "Binance limit vadutundi - adi close cheyandi.")
+        st.stop()
+    chk.success(f"Binance OK ({time.time() - t_probe:.1f}s) · {base.split('//')[1]} · "
+                f"{len(symbols)} coins")
+
     prog = st.progress(0.0, text="Starting...")
     t0 = time.time()
 
-    def on_progress(done, total):
-        prog.progress(done / total, text=f"{done}/{total} jobs done · {time.time() - t0:.0f}s")
+    def on_status(text, frac):
+        prog.progress(min(max(frac, 0.0), 1.0), text=text)
 
     df, fail = bt.run_backtest(
-        base, symbols, tfs, n_test, cfg, chosen, n_1m=n_1m, progress=on_progress)
+        base, symbols, tfs, n_test, cfg, chosen, n_1m=n_1m, status=on_status)
     prog.empty()
     st.session_state["bt"] = dict(
         df=df, fail=fail, cfg=cfg, chosen=chosen, n_coins=len(symbols), tfs=tfs,
-        took=time.time() - t0, n_test=n_test, n_1m=n_1m,
+        took=time.time() - t0, n_test=n_test, n_1m=n_1m, diag=dict(bt.LAST),
         at=pd.Timestamp.now(tz=sc.IST).strftime("%d %b %H:%M"),
     )
 
@@ -151,6 +168,12 @@ if not R:
     st.stop()
 
 df, cfg = R["df"], R["cfg"]
+diag = R.get("diag", {})
+if diag.get("errors"):
+    st.warning("Konni jobs fail ayyayi: " + " || ".join(diag["errors"][:3]))
+if df.empty and R["fail"]:
+    st.error(f"Data / jobs fail ayyayi ({R['fail']}). Binance: {diag.get('net', '-')}. "
+             "Konchem sepu aagi malli Run nokkandi.")
 mode = cfg.get("dir", sc.DIR_BOTH)
 NM = bt.strat_names(cfg)
 st.caption(
