@@ -719,6 +719,14 @@ def main():
         "pages/1_Backtest.py", icon="\U0001F9EA",
         label="Backtest - 1 lakh capital, win rate + PnL for every signal",
     )
+    st.page_link(
+        "pages/2_IFVG_Signals.py", icon="\U0001F3AF",
+        label="IFVG Signals - live scanner (trend + volume + trendline confluence)",
+    )
+    st.page_link(
+        "pages/3_IFVG_Backtest.py", icon="\U0001F4CA",
+        label="IFVG Backtest - plain vs filtered, train / test",
+    )
 
     # No sidebar and no scan button: scanning starts by itself with these defaults.
     with st.expander("⚙️ Settings (optional - scan automatic ga run avtundi)", expanded=False):
