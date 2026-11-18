@@ -1,5 +1,4 @@
-streamlit>=1.50
+streamlit>=1.37
 pandas
 numpy
 requests
-plotly
