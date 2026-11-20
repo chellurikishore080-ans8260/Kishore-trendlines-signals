@@ -1,14 +1,15 @@
 # =====================================================================
-#  Kishore Trendline + Candlestick Scanner (with Backtest)
+#  Kishore Trendline Zone Scanner - RESISTANCE SHORTS ONLY (with Backtest)
 #  Created by Kishore
 #
-#  - Trendline ZONE logic ported from a TradingView Pine indicator
-#    (pivot highs/lows -> best line with min touches -> ATR-wide zone)
-#  - A trade is taken only when a candlestick pattern forms AT the zone
-#    (Engulfing, Pin Bar, Momentum, Inside Bar, Three Methods,
-#     Morning/Evening Star, Three Soldiers/Crows)
-#  - Data: Binance Spot (data-api.binance.vision first, other hosts fallback)
-#  - Live scanner auto-refreshes, Backtest shows every trade + PnL + win/fail
+#  Logic = the ORIGINAL Trendline Zone logic, nothing else:
+#    - Pine "Trendlines" zone: pivot highs -> best line with min touches
+#      -> ATR-wide RESISTANCE zone
+#    - A candle wick touching the resistance zone = SHORT signal
+#    - NO candlestick pattern needed (no Engulfing / Pin Bar / etc.)
+#    - NO support / long side, NO trend filter
+#  Data: Binance Spot (data-api.binance.vision first, other hosts fallback)
+#  Live scanner auto-refreshes, Backtest shows every trade + PnL + win/fail
 # =====================================================================
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -34,11 +35,9 @@ HOSTS = [
 TF_SECONDS = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "4h": 14400, "1d": 86400}
 ALL_TFS = list(TF_SECONDS)
 DEFAULT_TFS = ["1m", "5m", "15m", "30m", "4h", "1d"]
-PATTERNS = ["Engulfing", "Pin Bar", "Momentum", "Inside Bar", "Three Methods",
-            "Morning/Evening Star", "Soldiers/Crows"]
-PRIORITY = ["Engulfing", "Morning/Evening Star", "Pin Bar", "Momentum",
-            "Inside Bar", "Soldiers/Crows", "Three Methods"]
 IST = "Asia/Kolkata"
+STABILITY = 5            # stability buffer in bars (same as the Pine script)
+MIN_BARS = 120           # minimum closed candles needed to build a zone
 STABLE_BASES = {"USDC", "FDUSD", "TUSD", "BUSD", "DAI", "USDP", "EUR", "AEUR", "USDE",
                 "XUSD", "PYUSD", "UST", "USD1", "EURI", "WBTC"}
 FALLBACK_COINS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "ADAUSDT",
@@ -48,20 +47,16 @@ FALLBACK_COINS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "DOGEUS
 
 @dataclass(frozen=True)
 class Params:
-    # --- trendline zone (same as Pine defaults) ---
+    # --- trendline zone (same as the original script / Pine defaults) ---
     back_bars: int = 300
     pivot_src: str = "High/Low"
     pivot_strength: int = 10
     min_touches: int = 3
     atr_mult: float = 0.5
-    refresh: int = 8                 # zone re-calc every N bars (and on every new pivot)
-    # --- candlestick confirmation ---
-    patterns: tuple = tuple(PATTERNS)
-    engulf_confirm: bool = True      # wait for 3rd confirmation candle after engulfing
-    trend_filter: bool = True        # long only if EMA50>EMA200, short only if EMA50<EMA200
-    sides: tuple = ("LONG", "SHORT")
-    zone_tol_atr: float = 0.1
-    # --- trade management ---
+    refresh: int = 8                 # backtest: zone re-calc every N bars (and on every new pivot)
+    pierce: bool = False             # also count a wick spiking through the whole zone
+    cooldown: int = 5                # FRESH touch = no touch in the previous N candles
+    # --- trade management (SHORT only) ---
     sl_buffer_atr: float = 0.15
     min_risk_atr: float = 0.8
     max_risk_atr: float = 3.0
@@ -138,9 +133,10 @@ def top_symbols(topn):
 
 
 # ---------------------------------------------------------------------
-# INDICATORS
+# INDICATORS / HELPERS
 # ---------------------------------------------------------------------
 def atr_rma(h, l, c, n=14):
+    """Wilder ATR (same as Pine ta.atr)."""
     pc = np.r_[np.nan, c[:-1]]
     tr = np.maximum(h - l, np.maximum(np.abs(h - pc), np.abs(l - pc)))
     tr[0] = h[0] - l[0]
@@ -154,10 +150,6 @@ def atr_rma(h, l, c, n=14):
     return out
 
 
-def ema(a, n):
-    return pd.Series(a).ewm(span=n, adjust=False).mean().to_numpy()
-
-
 def shift(a, k):
     n = len(a)
     out = np.zeros(n, bool) if a.dtype == bool else np.full(n, np.nan)
@@ -167,6 +159,7 @@ def shift(a, k):
 
 
 def win_any(x, sp):
+    """True where x was True at least once in the last `sp` bars (incl. current)."""
     cs = np.cumsum(x.astype(np.int32))
     out = cs.copy()
     if sp < len(x):
@@ -175,25 +168,25 @@ def win_any(x, sp):
 
 
 # ---------------------------------------------------------------------
-# TRENDLINE ZONE (port of the Pine logic)
+# RESISTANCE TRENDLINE ZONE  (the ORIGINAL logic - port of the Pine script)
 # ---------------------------------------------------------------------
-def find_pivots(a, s, is_high):
+def find_pivot_highs(a, s):
+    """Pivot highs with s bars on each side (same tie rule as the original script)."""
     n = len(a)
     if n < 2 * s + 1:
         return np.array([], int), np.array([])
     w = swv(a, 2 * s + 1)
     ctr, left, right = w[:, s], w[:, :s], w[:, s + 1:]
-    if is_high:
-        ok = (ctr > left.max(1)) & (ctr >= right.max(1))
-    else:
-        ok = (ctr < left.min(1)) & (ctr <= right.min(1))
+    ok = (ctr >= left.max(1)) & (ctr > right.max(1))
     idx = np.nonzero(ok)[0] + s
     return idx, a[idx]
 
 
-def best_zone(px, py, cur, close, thr, is_res, p):
-    """Line through 2 pivots with >= min_touches pivots inside +-thr, not broken
+def best_zone(px, py, cur, close, thr, p):
+    """Line through 2 pivot highs with >= min_touches pivots inside +-thr, not broken
     by older pivots, closest to current price. Returns (x1, y1, slope, up, dn)."""
+    if thr <= 0 or not np.isfinite(thr):
+        return None
     sel = px >= cur - p.back_bars
     x = px[sel].astype(float)
     y = py[sel]
@@ -212,8 +205,8 @@ def best_zone(px, py, cur, close, thr, is_res, p):
     after = np.arange(m)[None, :] >= ii[:, None]
     touch = (np.abs(diff) <= thr) & after
     touches = touch.sum(1)
-    stab = (x < cur - 5)[None, :]
-    breach = ((diff > thr) if is_res else (diff < -thr)) & after & stab
+    stab = (x < cur - STABILITY)[None, :]
+    breach = (diff > thr) & after & stab            # resistance broken by an older pivot
     valid = (touches >= p.min_touches) & ~breach.any(1)
     if not valid.any():
         return None
@@ -230,171 +223,70 @@ def zone_bounds(params, idx):
     return base + up, base + dn
 
 
-def compute_zones(h, l, c, atr, p):
-    """Walk-forward: at every bar only pivots already confirmed are used (no look-ahead)."""
+def compute_res_zones(h, l, c, atr, p):
+    """Walk-forward: at every bar only pivots already confirmed are used (no look-ahead).
+    Row e = zone params computed with data up to and including bar e."""
     n, s = len(c), p.pivot_strength
-    srcH = c if p.pivot_src == "Close" else h
-    srcL = c if p.pivot_src == "Close" else l
-    ph_i, ph_v = find_pivots(srcH, s, True)
-    pl_i, pl_v = find_pivots(srcL, s, False)
-    conf_h, conf_l = ph_i + s, pl_i + s
-    ev = np.unique(np.r_[conf_h, conf_l, np.arange(0, n, p.refresh), n - 1]).astype(int)
+    src = c if p.pivot_src == "Close" else h
+    ph_i, ph_v = find_pivot_highs(src, s)
+    conf = ph_i + s
+    ev = np.unique(np.r_[conf, np.arange(0, n, p.refresh), n - 1]).astype(int)
     ev = ev[(ev >= 0) & (ev < n)]
     res = np.full((n, 5), np.nan)
-    sup = np.full((n, 5), np.nan)
     for k, e in enumerate(ev):
         nxt = ev[k + 1] if k + 1 < len(ev) else n
         a = atr[e]
         if np.isnan(a):
             continue
-        thr = a * p.atr_mult
-        m = conf_h <= e
-        z = best_zone(ph_i[m], ph_v[m], e, c[e], thr, True, p)
+        m = conf <= e
+        z = best_zone(ph_i[m], ph_v[m], e, c[e], a * p.atr_mult, p)
         if z is not None:
             res[e:nxt] = z
-        m = conf_l <= e
-        z = best_zone(pl_i[m], pl_v[m], e, c[e], thr, False, p)
-        if z is not None:
-            sup[e:nxt] = z
-    idx = np.arange(n)
-    top_r, bot_r = zone_bounds(res, idx)
-    top_s, bot_s = zone_bounds(sup, idx)
-    return dict(top_r=top_r, bot_r=bot_r, top_s=top_s, bot_s=bot_s, res=res, sup=sup)
+    return res
+
+
+def touch_mask(h, l, top, bot, pierce):
+    """Original wick-touch rule: the high or the low of the candle is inside the zone."""
+    t = ((h >= bot) & (h <= top)) | ((l <= top) & (l >= bot))
+    if pierce:                                       # wick spikes straight through the whole zone
+        t = t | ((h > top) & (l < bot))
+    return t
 
 
 # ---------------------------------------------------------------------
-# CANDLESTICK PATTERNS  ->  {name: (bull_mask, bear_mask, span, must_clear_zone)}
+# SIGNALS  (resistance wick touch -> SHORT, any candle, no pattern needed)
 # ---------------------------------------------------------------------
-def candle_patterns(o, h, l, c, atr, p):
-    n = len(c)
-    body = np.abs(c - o)
-    rng = h - l
-    up_w = h - np.maximum(o, c)
-    lo_w = np.minimum(o, c) - l
-    bull, bear = c > o, c < o
-    avg_body = pd.Series(body).rolling(14, min_periods=5).mean().to_numpy()
-    avg_rng = pd.Series(rng).rolling(14, min_periods=5).mean().to_numpy()
-    pats = {}
-
-    # 1) Engulfing (optionally wait for confirmation candle)
-    eb = shift(bear, 1) & bull & (o <= shift(c, 1)) & (c >= shift(o, 1)) & (body > shift(body, 1))
-    es = shift(bull, 1) & bear & (o >= shift(c, 1)) & (c <= shift(o, 1)) & (body > shift(body, 1))
-    if p.engulf_confirm:
-        pats["Engulfing"] = (shift(eb, 1) & bull & (c > shift(c, 1)),
-                             shift(es, 1) & bear & (c < shift(c, 1)), 3, False)
-    else:
-        pats["Engulfing"] = (eb, es, 2, False)
-
-    # 2) Pin bar (hammer / shooting star)
-    big = rng >= 0.7 * atr
-    pin_b = big & (lo_w >= 0.6 * rng) & (up_w <= 0.2 * rng) & (body <= 0.35 * rng)
-    pin_s = big & (up_w >= 0.6 * rng) & (lo_w <= 0.2 * rng) & (body <= 0.35 * rng)
-    pats["Pin Bar"] = (pin_b, pin_s, 1, False)
-
-    # 3) Momentum candle (big body, tiny wicks) that clears the zone
-    mom = (body >= 0.7 * rng) & (body >= 1.5 * avg_body)
-    pats["Momentum"] = (mom & bull, mom & bear, 3, True)
-
-    # 4) Inside bar breakout of the mother bar
-    mh, ml = shift(h, 2), shift(l, 2)
-    inside = (shift(h, 1) <= mh) & (shift(l, 1) >= ml) & (shift(rng, 2) >= 1.2 * shift(avg_rng, 2))
-    pats["Inside Bar"] = (inside & (c > mh), inside & (c < ml), 3, True)
-
-    # 5) Three methods (rising / falling)
-    mid_up = np.ones(n, bool)
-    mid_dn = np.ones(n, bool)
-    for k in (1, 2, 3):
-        inr = (shift(h, k) <= shift(h, 4)) & (shift(l, k) >= shift(l, 4)) & (shift(body, k) < shift(body, 4))
-        mid_up &= inr
-        mid_dn &= inr
-    first_up = shift(bull, 4) & (shift(body, 4) >= 1.2 * shift(avg_body, 4))
-    first_dn = shift(bear, 4) & (shift(body, 4) >= 1.2 * shift(avg_body, 4))
-    pats["Three Methods"] = (first_up & mid_up & bull & (c > shift(c, 4)),
-                             first_dn & mid_dn & bear & (c < shift(c, 4)), 5, False)
-
-    # 6) Morning / Evening star
-    mid_o = (shift(o, 2) + shift(c, 2)) / 2
-    morning = shift(bear, 2) & (shift(body, 2) >= avg_body * 0.0 + shift(avg_body, 2)) & \
-        (shift(body, 1) <= 0.35 * shift(body, 2)) & bull & (c > mid_o)
-    evening = shift(bull, 2) & (shift(body, 2) >= shift(avg_body, 2)) & \
-        (shift(body, 1) <= 0.35 * shift(body, 2)) & bear & (c < mid_o)
-    pats["Morning/Evening Star"] = (morning, evening, 3, False)
-
-    # 7) Three white soldiers / black crows
-    strong = (body >= 0.5 * rng)
-    s1, s2 = shift(strong, 1), shift(strong, 2)
-    sol = bull & shift(bull, 1) & shift(bull, 2) & strong & s1 & s2 & \
-        (c > shift(c, 1)) & (shift(c, 1) > shift(c, 2)) & \
-        (o > shift(o, 1)) & (o < shift(c, 1)) & (shift(o, 1) > shift(o, 2)) & (shift(o, 1) < shift(c, 2))
-    cro = bear & shift(bear, 1) & shift(bear, 2) & strong & s1 & s2 & \
-        (c < shift(c, 1)) & (shift(c, 1) < shift(c, 2)) & \
-        (o < shift(o, 1)) & (o > shift(c, 1)) & (shift(o, 1) < shift(o, 2)) & (shift(o, 1) > shift(c, 2))
-    pats["Soldiers/Crows"] = (sol, cro, 3, False)
-    return pats
-
-
-# ---------------------------------------------------------------------
-# SIGNALS  (trendline zone touch + candlestick pattern)
-# ---------------------------------------------------------------------
-SIG_COLS = ["bar", "side", "pattern", "sl_raw", "atr", "zone_top", "zone_bot", "time", "close"]
+SIG_COLS = ["bar", "sl_raw", "atr", "zone_top", "zone_bot", "time", "close"]
 
 
 def generate_signals(df, p):
-    o, h, l, c = (df[k].to_numpy() for k in ("o", "h", "l", "c"))
+    h, l, c = (df[k].to_numpy() for k in ("h", "l", "c"))
     n = len(c)
-    if n < 60:
+    if n < MIN_BARS:
         return pd.DataFrame(columns=SIG_COLS), None
     atr = atr_rma(h, l, c)
-    e50, e200 = ema(c, 50), ema(c, 200)
-    valid_ema = np.arange(n) >= 200
-    z = compute_zones(h, l, c, atr, p)
-    pats = candle_patterns(o, h, l, c, atr, p)
-    tol = p.zone_tol_atr * atr
-    atr_ok = ~np.isnan(atr)
+    res = compute_res_zones(h, l, c, atr, p)
+    # the zone a candle is compared with was known at the END of the previous candle
+    lag = np.vstack([np.full((1, 5), np.nan), res[:-1]])
+    top, bot = zone_bounds(lag, np.arange(n))
+    zone_ok = ~np.isnan(top) & ~np.isnan(atr)
+    touch = zone_ok & touch_mask(h, l, top, bot, p.pierce)
+    fresh = touch & ~win_any(shift(touch, 1), p.cooldown)     # first touch only
     ct = df["ct"].to_numpy()
-    win_lo, win_hi = {}, {}
-    for sp in (1, 2, 3, 5):
-        win_lo[sp] = pd.Series(l).rolling(sp, min_periods=1).min().to_numpy()
-        win_hi[sp] = pd.Series(h).rolling(sp, min_periods=1).max().to_numpy()
     rows = []
-    for side in p.sides:
-        long_ = side == "LONG"
-        top, bot = (z["top_s"], z["bot_s"]) if long_ else (z["top_r"], z["bot_r"])
-        zone_ok = ~np.isnan(top)
-        touch = zone_ok & (l <= top + tol) & (h >= bot - tol)
-        if p.trend_filter:
-            trend = ((e50 > e200) if long_ else (e50 < e200)) & valid_ema
-        else:
-            trend = np.ones(n, bool)
-        chosen = np.full(n, -1)
-        for pi, name in enumerate(PRIORITY):
-            if name not in p.patterns:
-                continue
-            bull_m, bear_m, sp, clear = pats[name]
-            m = bull_m if long_ else bear_m
-            gate = (c > bot) if long_ else (c < top)
-            if clear:
-                gate = gate & ((c > top) if long_ else (c < bot))
-            mask = m & win_any(touch, sp) & gate & trend & atr_ok & zone_ok
-            chosen[mask & (chosen < 0)] = pi
-        for t in np.nonzero(chosen >= 0)[0]:
-            name = PRIORITY[chosen[t]]
-            sp = pats[name][2]
-            if long_:
-                sl_raw = min(win_lo[sp][t], bot[t]) - p.sl_buffer_atr * atr[t]
-            else:
-                sl_raw = max(win_hi[sp][t], top[t]) + p.sl_buffer_atr * atr[t]
-            rows.append(dict(bar=int(t), side=side, pattern=name, sl_raw=float(sl_raw), atr=float(atr[t]),
-                             zone_top=float(top[t]), zone_bot=float(bot[t]),
-                             time=pd.to_datetime(ct[t] + 1, unit="ms", utc=True).tz_convert(IST),
-                             close=float(c[t])))
-    sig = pd.DataFrame(rows, columns=SIG_COLS).sort_values("bar").reset_index(drop=True)
-    return sig, dict(n=n, atr=atr, res=z["res"], sup=z["sup"])
+    for t in np.nonzero(fresh)[0]:
+        sl_raw = max(h[t], top[t]) + p.sl_buffer_atr * atr[t]
+        rows.append(dict(bar=int(t), sl_raw=float(sl_raw), atr=float(atr[t]),
+                         zone_top=float(top[t]), zone_bot=float(bot[t]),
+                         time=pd.to_datetime(ct[t] + 1, unit="ms", utc=True).tz_convert(IST),
+                         close=float(c[t])))
+    sig = pd.DataFrame(rows, columns=SIG_COLS)
+    return sig, dict(n=n, atr=atr, res=res, touch=touch)
 
 
-def build_levels(side, entry, sl_raw, atr, p):
-    d = 1 if side == "LONG" else -1
-    risk = (entry - sl_raw) * d
+def build_levels(entry, sl_raw, atr, p):
+    """SHORT: SL above the zone, TP below by RR."""
+    risk = sl_raw - entry
     if not np.isfinite(risk) or risk <= 0:
         return None
     risk = max(risk, p.min_risk_atr * atr)
@@ -402,15 +294,15 @@ def build_levels(side, entry, sl_raw, atr, p):
         return None
     if (p.rr * risk / entry) < p.min_tp_fee_mult * 2 * p.fee:
         return None
-    return dict(sl=entry - d * risk, tp=entry + d * p.rr * risk, risk=risk)
+    return dict(sl=entry + risk, tp=entry - p.rr * risk, risk=risk)
 
 
 # ---------------------------------------------------------------------
-# BACKTEST
+# BACKTEST  (shorts only)
 # ---------------------------------------------------------------------
 def backtest_df(df, symbol, tf, p, capital, size_pct):
     sig, _ = generate_signals(df, p)
-    o, h, l, c = (df[k].to_numpy() for k in ("o", "h", "l", "c"))
+    h, l, c, o = (df[k].to_numpy() for k in ("h", "l", "c", "o"))
     t_open = df["t"].to_numpy()
     t_close = df["ct"].to_numpy()
     n = len(c)
@@ -421,16 +313,13 @@ def backtest_df(df, symbol, tf, p, capital, size_pct):
         if a >= n or a <= last_exit:
             continue
         entry = o[a]
-        lv = build_levels(r.side, entry, r.sl_raw, r.atr, p)
+        lv = build_levels(entry, r.sl_raw, r.atr, p)
         if lv is None:
             continue
         sl, tp = lv["sl"], lv["tp"]
         end = min(n - 1, a + p.max_hold)
         lo, hi = l[a:end + 1], h[a:end + 1]
-        if r.side == "LONG":
-            sl_hit, tp_hit = lo <= sl, hi >= tp
-        else:
-            sl_hit, tp_hit = hi >= sl, lo <= tp
+        sl_hit, tp_hit = hi >= sl, lo <= tp
         i_sl = int(np.argmax(sl_hit)) if sl_hit.any() else 10 ** 9
         i_tp = int(np.argmax(tp_hit)) if tp_hit.any() else 10 ** 9
         if i_sl == 10 ** 9 and i_tp == 10 ** 9:
@@ -439,28 +328,28 @@ def backtest_df(df, symbol, tf, p, capital, size_pct):
             x, exit_px, reason = end, c[end], "TIMEOUT"
         elif i_sl <= i_tp:                    # SL first (conservative when both in one candle)
             x = a + i_sl
-            exit_px = min(sl, o[x]) if r.side == "LONG" else max(sl, o[x])
+            exit_px = max(sl, o[x])           # gap above SL fills at the open
             if x == a:
                 exit_px = sl
             reason = "SL"
         else:
             x, exit_px, reason = a + i_tp, tp, "TP"
-        d = 1 if r.side == "LONG" else -1
         notional = size_pct * equity
-        gross = notional * (exit_px / entry - 1) * d
+        gross = notional * (1 - exit_px / entry)          # short
         fees = notional * p.fee * (1 + exit_px / entry)
         pnl = gross - fees
         equity += pnl
         eq_curve.append(equity)
         last_exit = x
         trades.append(dict(
-            Coin=symbol.replace("USDT", ""), TF=tf, Side=r.side, Pattern=r.pattern,
+            Coin=symbol.replace("USDT", ""), TF=tf, Side="SHORT",
             entry_time=pd.to_datetime(t_open[a], unit="ms", utc=True).tz_convert(IST),
             exit_time=pd.to_datetime(t_close[x] + 1, unit="ms", utc=True).tz_convert(IST),
             hold_min=round((t_close[x] + 1 - t_open[a]) / 60000, 1),
+            zone_bot=r.zone_bot, zone_top=r.zone_top,
             entry=entry, exit=exit_px, sl=sl, tp=tp, reason=reason,
             success=bool(pnl > 0), pnl=pnl, net_pct=pnl / notional * 100,
-            R=(exit_px - entry) * d / lv["risk"]))
+            R=(entry - exit_px) / lv["risk"]))
     tr = pd.DataFrame(trades)
     eq = np.array(eq_curve)
     peak = np.maximum.accumulate(eq)
@@ -500,7 +389,7 @@ def analyze_live(df, symbol, tf, p, recent_k, store):
     now_ms = time.time() * 1000
     closed = df[df.ct < now_ms].reset_index(drop=True)
     live = df[df.ct >= now_ms]
-    if len(closed) < 250:
+    if len(closed) < MIN_BARS:
         return [], None
     key = (symbol, tf)
     stamp = (float(closed.ct.iloc[-1]), repr(p))
@@ -510,36 +399,44 @@ def analyze_live(df, symbol, tf, p, recent_k, store):
     else:
         sig, ctx = generate_signals(closed, p)
         store["a"][key] = (stamp, sig, ctx)
+    if ctx is None:
+        return [], None
     n = ctx["n"]
+    coin = symbol.replace("USDT", "")
     out = []
+    # 1) fresh touches on the last few CLOSED candles
     for r in sig[sig.bar >= n - recent_k].itertuples():
-        lv = build_levels(r.side, r.close, r.sl_raw, r.atr, p)
+        lv = build_levels(r.close, r.sl_raw, r.atr, p)
         if lv is None:
             continue
-        out.append(dict(Coin=symbol.replace("USDT", ""), TF=tf, Side=r.side, Pattern=r.pattern,
-                        ago=n - 1 - r.bar, time=r.time, Entry=fmt(r.close), SL=fmt(lv["sl"]), TP=fmt(lv["tp"]),
+        out.append(dict(Coin=coin, TF=tf, Side="SHORT", ago=n - 1 - r.bar, time=r.time,
+                        Entry=fmt(r.close), SL=fmt(lv["sl"]), TP=fmt(lv["tp"]),
                         Risk=f"{lv['risk'] / r.close * 100:.2f}%",
                         Zone=f"{fmt(r.zone_bot)} - {fmt(r.zone_top)}"))
+    # 2) the candle that is forming right now
     watch = None
     if len(live):
         lh, ll, lc = float(live.h.iloc[-1]), float(live.l.iloc[-1]), float(live.c.iloc[-1])
-        atr_last = ctx["atr"][-1]
-        cands = []
-        for label, arr in (("SUPPORT", ctx["sup"]), ("RESISTANCE", ctx["res"])):
-            x1, y1, sl_, up, dn = arr[-1]
-            if np.isnan(x1):
-                continue
+        atr_last = float(ctx["atr"][-1])
+        x1, y1, sl_, up, dn = ctx["res"][-1]
+        if not np.isnan(x1):
             base = y1 + sl_ * (n - x1)
             top, bot = base + up, base + dn
-            tol = p.zone_tol_atr * atr_last
-            touching = (ll <= top + tol) and (lh >= bot - tol)
-            dist = 0.0 if touching else min(abs(lc - top), abs(lc - bot))
+            touching = bool(touch_mask(np.array([lh]), np.array([ll]), top, bot, p.pierce)[0])
+            is_fresh = not bool(ctx["touch"][-p.cooldown:].any())
+            if touching and is_fresh:
+                lv = build_levels(lc, max(lh, top) + p.sl_buffer_atr * atr_last, atr_last, p)
+                if lv is not None:
+                    t_live = pd.to_datetime(float(live.t.iloc[-1]), unit="ms", utc=True).tz_convert(IST)
+                    out.append(dict(Coin=coin, TF=tf, Side="SHORT", ago=-1, time=t_live,
+                                    Entry=fmt(lc), SL=fmt(lv["sl"]), TP=fmt(lv["tp"]),
+                                    Risk=f"{lv['risk'] / lc * 100:.2f}%",
+                                    Zone=f"{fmt(bot)} - {fmt(top)}"))
+            dist = 0.0 if touching else (bot - lc if lc < bot else lc - top)
             if touching or dist <= 0.5 * atr_last:
-                cands.append(dict(Coin=symbol.replace("USDT", ""), TF=tf, Zone=label,
-                                  Status="TOUCHING" if touching else "NEAR", Price=fmt(lc),
-                                  Top=fmt(top), Bottom=fmt(bot), dist=dist / lc * 100))
-        if cands:
-            watch = cands
+                watch = [dict(Coin=coin, TF=tf, Status="TOUCHING" if touching else "NEAR",
+                              Touch="FRESH" if is_fresh else "REPEAT", Price=fmt(lc),
+                              Top=fmt(top), Bottom=fmt(bot), dist=dist / lc * 100)]
     return out, watch
 
 
@@ -585,16 +482,16 @@ def settings_ui():
         c1, c2 = st.columns(2)
         with c1:
             tfs = st.multiselect("Timeframes", ALL_TFS, DEFAULT_TFS)
-            sides = st.multiselect("Sides", ["LONG", "SHORT"], ["LONG", "SHORT"])
-            pats = st.multiselect("Candlestick patterns", PATTERNS, PATTERNS)
-            trend = st.checkbox("Trend filter (EMA50 vs EMA200)", True)
-            conf = st.checkbox("Engulfing: wait for confirmation candle", True)
-        with c2:
+            src = st.selectbox("Pivot source", ["High/Low", "Close"])
+            pierce = st.checkbox("Also count a wick that spikes through the whole zone", False)
+            cooldown = st.slider("Fresh-touch cooldown (candles)", 1, 50, 5)
             rr = st.slider("Risk : Reward", 1.0, 4.0, 2.0, 0.5)
+        with c2:
             strength = st.slider("Pivot strength", 5, 15, 10)
             touches = st.slider("Min pivot confirmation", 2, 8, 3)
             back = st.slider("Bars to apply", 50, 500, 300, 10)
             max_hold = st.slider("Max candles in trade", 10, 200, 60, 5)
+            refresh_bt = st.slider("Backtest: zone re-calc every N candles", 1, 20, 8)
         c3, c4 = st.columns(2)
         with c3:
             fee = st.number_input("Fee per side %", 0.0, 1.0, 0.1, 0.01, format="%.2f") / 100
@@ -603,9 +500,8 @@ def settings_ui():
             size = st.slider("Capital used per trade %", 10, 100, 50, 5) / 100
             topn = st.slider("Live: top coins by volume", 10, 100, 40, 5)
             refresh = st.slider("Live refresh (seconds)", 20, 300, 60, 10)
-    p = Params(back_bars=back, pivot_strength=strength, min_touches=touches,
-               patterns=tuple(pats), engulf_confirm=conf, trend_filter=trend,
-               sides=tuple(sides), rr=rr, max_hold=max_hold, fee=fee)
+    p = Params(back_bars=back, pivot_src=src, pivot_strength=strength, min_touches=touches,
+               refresh=refresh_bt, pierce=pierce, cooldown=cooldown, rr=rr, max_hold=max_hold, fee=fee)
     cfg = dict(tfs=tfs or DEFAULT_TFS, topn=topn, refresh=refresh, capital=capital, size=size)
     return p, cfg
 
@@ -619,31 +515,32 @@ def live_tab(p, cfg):
         sigs, watch, errs, njobs = live_scan(store, symbols, cfg["tfs"], p, recent_k=3)
         st.caption(f"Last scan {pd.Timestamp.now(tz=IST).strftime('%H:%M:%S')} IST · {len(symbols)} coins × "
                    f"{len(cfg['tfs'])} TFs · {errs} fetch errors · {time.time() - t0:.0f}s")
-        st.subheader("🎯 Signals (zone touch + candlestick pattern)")
+        st.subheader("🔴 SHORT signals (resistance zone touch)")
         if sigs:
             d = pd.DataFrame(sigs).sort_values(["ago", "time"], ascending=[True, False])
             seen = st.session_state.setdefault("seen", None)
-            keys = {(r.Coin, r.TF, r.Side, str(r.time)) for r in d.itertuples()}
-            fresh = {(r.Coin, r.TF, r.Side, str(r.time)): r for r in d.itertuples() if r.ago == 0}
+            keys = {(r.Coin, r.TF, str(r.time)) for r in d.itertuples()}
+            fresh = {(r.Coin, r.TF, str(r.time)): r for r in d.itertuples() if r.ago <= 0}
             if seen is not None:
                 for k, r in fresh.items():
                     if k not in seen:
-                        st.toast(f"{r.Side} {r.Coin} {r.TF} · {r.Pattern}")
+                        st.toast(f"SHORT {r.Coin} {r.TF} · resistance touch")
             st.session_state["seen"] = keys
-            d["Fresh"] = np.where(d.ago == 0, "🔥 NEW", d.ago.astype(str) + " candle ago")
+            d["Fresh"] = np.where(d.ago < 0, "🔥 TOUCHING NOW",
+                                  np.where(d.ago == 0, "🔥 NEW", d.ago.astype(str) + " candle ago"))
             d["Signal time (IST)"] = d.time.dt.strftime("%d-%b %H:%M")
-            d["Side"] = np.where(d.Side == "LONG", "🟢 LONG", "🔴 SHORT")
-            st.dataframe(d[["Fresh", "Coin", "TF", "Side", "Pattern", "Signal time (IST)", "Entry", "SL", "TP",
+            d["Side"] = "🔴 SHORT"
+            st.dataframe(d[["Fresh", "Coin", "TF", "Side", "Signal time (IST)", "Entry", "SL", "TP",
                             "Risk", "Zone"]], hide_index=True)
         else:
-            st.info("No confirmed signal right now. Waiting for a pattern at the trendline zone.")
-        st.subheader("👀 Zone watch (price touching / near the zone, waiting for a pattern)")
+            st.info("No resistance touch right now. Waiting for price to reach a resistance zone.")
+        st.subheader("👀 Resistance watch (price touching / near the zone)")
         if watch:
             w = pd.DataFrame(watch).sort_values(["Status", "dist"], ascending=[False, True])
             w["dist"] = w.dist.round(2).astype(str) + "%"
             st.dataframe(w.rename(columns={"dist": "Distance"}), hide_index=True)
         else:
-            st.write("Nothing at a zone right now.")
+            st.write("Nothing at a resistance zone right now.")
 
     if hasattr(st, "fragment"):
         st.fragment(render, run_every=cfg["refresh"])()
@@ -689,8 +586,9 @@ def backtest_tab(p, cfg):
         st.session_state["bt"] = (pd.concat(trades, ignore_index=True) if trades else pd.DataFrame(),
                                   pd.DataFrame(stats), errs)
     if "bt" not in st.session_state:
-        st.info("Press **Run Backtest**. Every coin × timeframe starts with its own capital; entry is on the "
-                "next candle's open, SL/TP checked candle by candle (SL first if both hit in one candle), "
+        st.info("Press **Run Backtest** (SHORTS only). Every resistance-zone touch = one short. "
+                "Every coin × timeframe starts with its own capital; entry is on the next candle's open, "
+                "SL above the zone / TP by RR checked candle by candle (SL first if both hit in one candle), "
                 "fees included. Win = real profit after fees.")
         return
     tr, stats, errs = st.session_state["bt"]
@@ -702,7 +600,7 @@ def backtest_tab(p, cfg):
 
     n, w = len(tr), int(tr.success.sum())
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Trades", n)
+    m1.metric("Trades (all SHORT)", n)
     m2.metric("Win rate", f"{100 * w / n:.1f}%")
     m3.metric("Total PnL", f"{tr.pnl.sum():,.0f}")
     m4.metric("Profit factor", pf(tr.pnl))
@@ -711,10 +609,6 @@ def backtest_tab(p, cfg):
     tf_order = {t: i for i, t in enumerate(ALL_TFS)}
     s_tf = summarize(tr, ["TF"])
     st.dataframe(s_tf.sort_values("TF", key=lambda s: s.map(tf_order)), hide_index=True)
-    st.subheader("🕯️ Pattern-wise (which candlestick works best)")
-    st.dataframe(summarize(tr, ["Pattern"]), hide_index=True)
-    st.subheader("↕️ Side-wise")
-    st.dataframe(summarize(tr, ["Side"]), hide_index=True)
     st.subheader("🪙 Coin-wise")
     st.dataframe(summarize(tr, ["Coin"]), hide_index=True)
 
@@ -751,10 +645,11 @@ def backtest_tab(p, cfg):
     v = v.sort_values("entry_time", ascending=False)
     show = pd.DataFrame({
         "Result": np.where(v.success, "✅ Success", "❌ Fail") + " (" + v.reason + ")",
-        "Coin": v.Coin, "TF": v.TF, "Side": v.Side, "Pattern": v.Pattern,
+        "Coin": v.Coin, "TF": v.TF, "Side": v.Side,
         "Entry time (IST)": v.entry_time.dt.strftime("%d-%b %H:%M"),
         "Exit time (IST)": v.exit_time.dt.strftime("%d-%b %H:%M"),
         "Held (min)": v.hold_min,
+        "Zone": v.zone_bot.map(fmt) + " - " + v.zone_top.map(fmt),
         "Entry": v.entry.map(fmt), "Exit": v.exit.map(fmt), "SL": v.sl.map(fmt), "TP": v.tp.map(fmt),
         "PnL": v.pnl.round(0), "Net %": v.net_pct.round(2), "R": v.R.round(2)})
     st.dataframe(show, hide_index=True)
@@ -763,12 +658,10 @@ def backtest_tab(p, cfg):
 
 def main():
     st.set_page_config(page_title="Kishore Trendline Scanner", page_icon="📐", layout="wide")
-    st.title("📐 Kishore Trendline + Candlestick Scanner")
-    st.caption("Trendline zone + candlestick confirmation · Binance Spot · 1m 5m 15m 30m 1h 4h 1d")
+    st.title("📐 Kishore Trendline Zone Scanner — Resistance SHORTS")
+    st.caption("Resistance trendline zone touch = SHORT · no candlestick pattern needed · Binance Spot · "
+               "1m 5m 15m 30m 1h 4h 1d")
     p, cfg = settings_ui()
-    if not p.patterns or not p.sides:
-        st.warning("Select at least one pattern and one side.")
-        return
     t1, t2 = st.tabs(["🔴 Live Scanner", "📊 Backtest"])
     with t1:
         live_tab(p, cfg)
